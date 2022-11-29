@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "socfpga_cyclone5.dtsi"
+#include "dpg_tree.dtsi"
+
+/ {
+	model = "Terasic DE1-SoC Development Kit";
+	compatible = "altr,socfpga-cyclone5", "altr,socfpga";
+
+	chosen {
+		bootargs = "earlyprintk";
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory {
+		name = "memory";
+		device_type = "memory";
+		reg = <0x0 0x40000000>; /* 1GB */
+	};
+
+	aliases {
+		/* This allows the ethaddr uboot environment variable
+		 * to be added to the gmac1 device tree blob
+		 */
+		ethernet0 = &gmac1;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		hps0 {
+			label = "user_led";
+			gpios = <&portb 24 0>;
+		};
+	};
+
+	regulator_3_3v: 3-3-v-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "3.3V";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+	};
+};
+
+&gmac1 {
+	status = "okay";
+	phy-mode = "rgmii";
+
+	rxd0-skew-ps = <0>;
+	rxd1-skew-ps = <0>;
+	rxd2-skew-ps = <0>;
+	rxd3-skew-ps = <0>;
+	txen-skew-ps = <0>;
+	txc-skew-ps = <2600>;
+	rxdv-skew-ps = <0>;
+	rxc-skew-ps = <2000>;
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&mmc0 {
+	cd-gpios = <&portb 18 0>;
+	vmmc-supply = <&regulator_3_3v>;
+	vqmmc-supply = <&regulator_3_3v>;
+	status = "okay";
+};
+
+&usb1 {
+	status = "okay";
+};
