@@ -4,24 +4,14 @@
 
 // Address spi master
 #define OFFSET_SPI_MASTER 0x0
-#define NUM_REGISTERS_SPI_MASTER 0x5
-#define BASE_SPI_MASTER LWBRIDGE_BASE+OFFSET_SPI_MASTER
-
-// Address data buffer
-#define OFFSET_DATA_BUFFER 0x100
-#define NUM_REGISTERS_DATA_BUFFER 0x20
-#define BASE_DATA_BUFFER LWBRIDGE_BASE+OFFSET_DATA_BUFFER
+#define NUM_REGISTERS 0x13
+#define BASE_SPI_MASTER (LWBRIDGE_BASE+OFFSET_SPI_MASTER)
 
 / {
 	soc {
-		DPG_SPI0: DPG_SPI0@DpgSpiMasterStartAddress {
+		DPG_SPI_MASTER_0: DPG_SPI0@DpgSpiMasterStartAddress {
 			compatible = "dpg,spi_master";
-			reg= <BASE_SPI_MASTER NUM_REGISTERS_SPI_MASTER>;
+			reg= <BASE_SPI_MASTER NUM_REGISTERS>;
 		};
-
-		DPG_DATA_BUFFER: DPG_DATA_BUFFER@DpgDataBufferStartAddress {
-			compatible = "dpg,spi_data_buffer";
-			reg= <BASE_DATA_BUFFER NUM_REGISTERS_DATA_BUFFER>;
-		};		
 	};
 };

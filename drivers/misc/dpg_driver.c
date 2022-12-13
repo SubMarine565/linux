@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *   A kernel module thats generates a running light
+ *  A kernel module that supports the data buffer and spi master
+ *  of the DPG project.
  */
+
 
 /*
  *	Fragen:
@@ -44,14 +46,30 @@
 #include <linux/miscdevice.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/printk.h>
+#include <linux/interrupt.h>
+#include <linux/kfifo.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+
 
 #define DRIVER_NAME "dpg_spi_master"
+#define DRIVER_NAME_LEN 15
+#define INTERRUPT_MASK 2
+#define INTERRUPT_ACK 3
+#define IRQ_ON 0xF
+#define IRQ_OFF 0x0
+
 #define OK 0
 
 // forward declaration
-static int spi_master_probe(struct platform_device *pdev);
+static ssize_t spi_master_open(struct inode *pinode, struct file *pfile);
 static int spi_master_remove(struct platform_device *pdev);
+static int spi_master_release(struct inode *inode, struct file *pfile);
+static int spi_master_probe(struct platform_device *pdev);
+static ssize_t spi_master_write(struct file *filp, const char __user *buf,
+				size_t count, loff_t *offp);
+static ssize_t spi_master_read(struct file *filp, char __user *buf, size_t count,
+			   loff_t *offp);
 static ssize_t spi_master_cpol_show(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t spi_master_cpol_store(struct device *dev, struct device_attribute *attr,
          const char *buf, size_t count);
@@ -67,13 +85,25 @@ static ssize_t spi_master_post_delay_store(struct device *dev, struct device_att
 static ssize_t spi_master_clk_per_half_bit_show(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t spi_master_clk_per_half_bit_store(struct device *dev, struct device_attribute *attr,
          const char *buf, size_t count);
+static ssize_t spi_master_gitrev_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t spi_master_gitrev_store(struct device *dev, struct device_attribute *attr,
+         const char *buf, size_t count);
 
+
+static const struct file_operations spi_master_fops = {
+	.open = spi_master_open,
+	.read = spi_master_read,
+	.write = spi_master_write,
+	.release = spi_master_release,
+};
 
 // device data struct
 struct spi_master {
 	u32 *registers; // dummy
-	struct miscdevice misc;	// TODO ergänzt für group??
+	struct miscdevice misc;
 	struct platform_device *pdev; // for print in read and write
+	struct mutex spi_master_mutex;
+	wait_queue_head_t wq;
 };
 
 static DEVICE_ATTR(cpol, 0664, spi_master_cpol_show, spi_master_cpol_store);
@@ -81,7 +111,7 @@ static DEVICE_ATTR(cpha, 0664, spi_master_cpha_show, spi_master_cpha_store);
 static DEVICE_ATTR(pre_delay, 0664, spi_master_pre_delay_show, spi_master_pre_delay_store);
 static DEVICE_ATTR(post_delay, 0664, spi_master_post_delay_show, spi_master_post_delay_store);
 static DEVICE_ATTR(clk_per_half_bit, 0664, spi_master_clk_per_half_bit_show, spi_master_clk_per_half_bit_store);
-
+static DEVICE_ATTR(git_rev, 0664, spi_master_gitrev_show, spi_master_gitrev_store);
 
 static struct attribute *spi_attrs[] = {
         &dev_attr_cpol.attr,
@@ -89,23 +119,16 @@ static struct attribute *spi_attrs[] = {
 		&dev_attr_pre_delay.attr,
 		&dev_attr_post_delay.attr,
 		&dev_attr_clk_per_half_bit.attr,
+		&dev_attr_git_rev.attr,
         NULL
 };
 
-// static struct attribute_group spi_group = {
-//         //.name = "dpg",
-//         .attrs = spi_attrs
-// };
-
-// static const struct attribute_group *spi_groups[] = {
-//     &spi_group,
-//     NULL
-// };
-
-// Makro creates spi_group and spi_groups
+// create spi_group and spi_groups
 ATTRIBUTE_GROUPS(spi);
 
-static struct device *sysfs_device;
+// TODO sysfs device nötig??
+// sysfs
+//static struct device *sysfs_device;
 
 // Supported devices
 static const struct of_device_id spi_master_of_match[] = {
@@ -121,37 +144,80 @@ static struct platform_driver spi_master_driver = {
 	.driver = { .name = DRIVER_NAME,
 			.owner = THIS_MODULE,
 			.of_match_table = of_match_ptr(spi_master_of_match),
-			.groups = spi_groups	// TODO Hier richtig bzw. funktioniert nicht
+			.groups = spi_groups	// TODO Hier richtig?? -> Files in /sys/bus/platform/drivers/dpg_spi_master
 			 },
 	.probe = spi_master_probe,
 	.remove = spi_master_remove
 };
 module_platform_driver(spi_master_driver);
 
+// TODO -> richitg machen
+// IRQ Handler
+/*
+static irqreturn_t handler_spi_master(int irq, void *dev_id)
+{
+	struct spi_master *data = dev_id;
+	u32 interrupt_status = 0;
 
+	interrupt_status =
+		ioread32(data->registers +
+			 INTERRUPT_ACK); // Check if IRQ from this device
+	if (!interrupt_status)
+		return IRQ_NONE; // if not bye
+
+	// acknowledge IRQ
+	iowrite32(IRQ_ON, data->registers + INTERRUPT_ACK);
+	// wake up wait queue
+	wake_up_interruptible(&data->wq);
+
+	return IRQ_HANDLED;
+}
+*/
+
+// file open -> lock file
+static ssize_t spi_master_open(struct inode *pinode, struct file *pfile)
+{
+	struct spi_master *spi_master =
+		container_of(pfile->private_data, struct spi_master, misc);
+
+	if (mutex_lock_interruptible(&spi_master->spi_master_mutex))
+		return -ERESTARTSYS;
+
+	return OK;
+}
+
+// file close -> release lock
+static int spi_master_release(struct inode *inode, struct file *pfile)
+{
+	struct spi_master *spi_master =
+		container_of(pfile->private_data, struct spi_master, misc);
+	mutex_unlock(&spi_master->spi_master_mutex);
+
+	return OK;
+}
+
+// TODO -> IRQ
 // Probe function -> driver loading
 static int spi_master_probe(struct platform_device *pdev)
 {
 	int status = 0;
-	char deviceName[10];
-	struct spi_master *spi_m = NULL;
+	//int irq = 0;
+	char deviceName[DRIVER_NAME_LEN];
+	struct spi_master *spi_master = NULL;
 	struct resource *io = NULL;
 	static atomic_t idx = ATOMIC_INIT(-1);
 	int deviceNumber = atomic_inc_return(&idx);
 	// generate device names
-	snprintf(deviceName, 10, "dpg_spi%d", deviceNumber);
+	snprintf(deviceName, DRIVER_NAME_LEN, "dpg_spi%d", deviceNumber);
 
 	dev_info(&pdev->dev, "Function %s entered.\n", __func__);
 
 	// alloc mem
-	spi_m = devm_kzalloc(&pdev->dev, sizeof(*spi_m), GFP_KERNEL);
-	if (IS_ERR(spi_m)) {
+	spi_master = devm_kzalloc(&pdev->dev, sizeof(*spi_master), GFP_KERNEL);
+	if (IS_ERR(spi_master)) {
 		dev_err(&pdev->dev, "Error in kzalloc.\n");
 		return -EFAULT;
 	}
-
-	// set data
-	platform_set_drvdata(pdev, spi_m);
 
 	// get resources
 	io = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -160,36 +226,49 @@ static int spi_master_probe(struct platform_device *pdev)
 		return -EFAULT;
 	}
 
-	spi_m->registers = devm_ioremap_resource(&pdev->dev, io);
-	if (IS_ERR(spi_m->registers)) {
+	spi_master->registers = devm_ioremap_resource(&pdev->dev, io);
+	if (IS_ERR(spi_master->registers)) {
 		dev_err(&pdev->dev, "Error in ioremap.\n");
 		return -EFAULT;
 	}
 
-	// TODO .groups oben beim driver dazugegeben -> Hat hier auch nicht funktioniert
-	//pdev->dev.groups = spi_groups;
+	// set data
+	platform_set_drvdata(pdev, spi_master);
+	spi_master->pdev = pdev;
 
+	// set information
+	spi_master->misc.name = deviceName;
+	spi_master->misc.minor = MISC_DYNAMIC_MINOR;
+	spi_master->misc.fops = &spi_master_fops;
+	spi_master->misc.parent = &pdev->dev;
 
-	// sysfs device
-	sysfs_device = root_device_register(deviceName);
-	if (IS_ERR(sysfs_device)) {
-		printk(KERN_INFO "Unable to register device\n");
-		status = -EEXIST;
-		return -EFAULT;
-		//goto remove_device;
+	// get pushbutton irq TODO
+	/*
+	irq = platform_get_irq(pdev, 0);
+	if (!irq) {
+		dev_err(&pdev->dev, "No IRQ resource\n");
+		return -ENODEV;
 	}
-	dev_set_drvdata(sysfs_device, &spi_m);
 
-	// TODO Unterordner in devices fuer spi device
-	// https://www.codetd.com/en/article/7166817
-	// Am Schluss Ordnerstrukut -> erzeugte Klasse als unterordner fuer device
+	if (devm_request_irq(&pdev->dev, irq, handler_spi_master, IRQF_SHARED,
+			     dev_name(&pdev->dev), spi_master)) {
+		dev_err(&pdev->dev, "failed to request IRQ\n");
+		return -ENOENT;
+	}
+	*/
+	init_waitqueue_head(&spi_master->wq);
 
-	// Gruppe anlegen
- 	status = sysfs_create_group(&sysfs_device->kobj, &spi_group);
-    if (status) {
-        dev_err(&pdev->dev, "sysfs creation failed\n");
-        return status;
-    }
+	mutex_init(&spi_master->spi_master_mutex);
+
+	// switch on IRQ
+	//iowrite32(IRQ_ON, spi_master->registers + INTERRUPT_MASK);
+
+	// register device
+	status = misc_register(&spi_master->misc);
+	if (status != OK) {
+		dev_err(&pdev->dev, "Error during device registration.\n");
+		return -EFAULT;
+	}
 
 	dev_info(&pdev->dev, "Leaving %s probe.\n", __func__);
 	return OK;
@@ -198,34 +277,87 @@ static int spi_master_probe(struct platform_device *pdev)
 // Remove function -> unload driver
 static int spi_master_remove(struct platform_device *pdev)
 {
-	struct spi_master *spi_m = NULL;
+	struct spi_master *spi_master = NULL;
 
 	dev_info(&pdev->dev, "Function %s entered.\n", __func__);
 
-	spi_m = platform_get_drvdata(pdev);
-
-
-	// TODO -> Funktion noetig? -> files verschwinden sowieso wenn device zerstoert wird -> Ja nötig
-	sysfs_remove_group(&sysfs_device->kobj, &spi_group);
-
+	spi_master = platform_get_drvdata(pdev);
+	// unmask IRQ TODO
+	//iowrite32(IRQ_OFF, spi_master->registers + INTERRUPT_MASK);
 	// unregister
-	root_device_unregister(sysfs_device);
-
-	// TODO Wie platfrom_... Auch 0 setzen? -> Ja aber bei misc device nicht mehr nötig (probably)
-	dev_set_drvdata(sysfs_device, NULL);
-
+	misc_deregister(&spi_master->misc);
 	// set device to null
 	platform_set_drvdata(pdev, NULL);
 
+	// TODO delete mutex -> hier richtig??
+	mutex_destroy(&spi_master->spi_master_mutex);
 
 	dev_info(&pdev->dev, "Leaving %s remove.\n", __func__);
 	return OK;
 }
 
+// TODO -> richitg machen
+static ssize_t spi_master_read(struct file *filp, char __user *buf, size_t count,
+			   loff_t *offp)
+{
+	/*
+	int led_intensity = 0;
+	int missing_bytes = 0;
+	struct spi_master *data =
+		container_of(filp->private_data, struct spi_master, misc);
+	dev_info(&data->pdev->dev, "In %s. count: %d, off: %lld\n",
+		 __func__, count, *offp);
 
+	// end of file
+	if (*offp >= 1)
+		return OK;
+
+	// small buffers
+	if (count < sizeof(led_intensity))
+		return -ETOOSMALL;
+
+	// Convert hex to percent
+	led_intensity = ioread32(data->registers) * LED_INTENSITY_100 / LED_ON;
+
+	missing_bytes = copy_to_user(buf, &led_intensity, 1);
+	if (missing_bytes > 0)
+		dev_info(&data->pdev->dev, "Error in %s\n", __func__);
+	*offp += 1;
+*/
+	return 1; // Zeichen gelesen
+}
+
+// TODO -> richitg machen
+static ssize_t spi_master_write(struct file *filp, const char __user *buf,
+				size_t count, loff_t *offp)
+{
+	/*
+	int led_intensity = 0;
+	int missing_bytes = 0;
+	int idx = 0;
+	struct spi_master *data =
+		container_of(filp->private_data, struct spi_master, misc);
+	dev_info(&data->pdev->dev, "In %s. count: %d, off: %lld\n",
+		 __func__, count, *offp);
+
+	for (idx = 0; idx < count; idx++) {
+		missing_bytes = copy_from_user(&led_intensity, buf + *offp, 1);
+
+		// check if value in range -> ignore value when outside of range
+		if (led_intensity <= 100 && led_intensity >= 0) {
+			iowrite32(LED_ON * led_intensity / LED_INTENSITY_100,
+				  data->registers);
+			msleep(200);
+		}
+		*offp += 1;
+	}
+	return count - missing_bytes;
+	*/
+	return count;
+}
 
 static ssize_t spi_master_cpol_show(struct device *dev, struct device_attribute *attr, char *buf){
-	
+
 	struct spi_master *data = dev_get_drvdata(dev);
 	int value = ioread32(data->registers);
 
@@ -235,7 +367,7 @@ static ssize_t spi_master_cpol_show(struct device *dev, struct device_attribute 
 
 static ssize_t spi_master_cpol_store(struct device *dev, struct device_attribute *attr,
          const char *buf, size_t count){
-	
+
 	int bit = 0;
 	struct spi_master *data = dev_get_drvdata(dev);
 
@@ -263,7 +395,7 @@ static ssize_t spi_master_cpol_store(struct device *dev, struct device_attribute
 
 
 static ssize_t spi_master_cpha_show(struct device *dev, struct device_attribute *attr, char *buf){
-	
+
 	struct spi_master *data = dev_get_drvdata(dev);
 	int value = ioread32(data->registers + 0x4);
 
@@ -295,7 +427,7 @@ static ssize_t spi_master_cpha_store(struct device *dev, struct device_attribute
 		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n", __func__, bit);
         return -EINVAL;
 	}
-	
+
     return count;
 }
 
@@ -333,7 +465,7 @@ static ssize_t spi_master_pre_delay_store(struct device *dev, struct device_attr
 		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n", __func__, bit);
         return -EINVAL;
 	}
-	
+
     return count;
 }
 
@@ -374,7 +506,7 @@ static ssize_t spi_master_post_delay_store(struct device *dev, struct device_att
 		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n", __func__, bit);
         return -EINVAL;
 	}
-	
+
     return count;
 }
 
@@ -390,7 +522,7 @@ static ssize_t spi_master_clk_per_half_bit_show(struct device *dev, struct devic
 
 static ssize_t spi_master_clk_per_half_bit_store(struct device *dev, struct device_attribute *attr,
          const char *buf, size_t count){
-    
+
 	int bit = 0;
 	struct spi_master *data = dev_get_drvdata(dev);
 
@@ -412,10 +544,27 @@ static ssize_t spi_master_clk_per_half_bit_store(struct device *dev, struct devi
 		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n", __func__, bit);
         return -EINVAL;
 	}
-	
+
     return count;
 }
 
+// TODO -> richitg machen
+static ssize_t spi_master_gitrev_show(struct device *dev, struct device_attribute *attr, char *buf){
+	
+	struct spi_master *data = dev_get_drvdata(dev);
+	int value = ioread32(data->registers + 0x10);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", value);
+
+}
+
+// TODO -> richitg machen
+static ssize_t spi_master_gitrev_store(struct device *dev, struct device_attribute *attr,
+         const char *buf, size_t count){
+
+	return count;
+}
+
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Driver for setting values of the DPG project spi master");
+MODULE_DESCRIPTION("Driver for the DPG project spi master");
 MODULE_AUTHOR("Paul Braher");

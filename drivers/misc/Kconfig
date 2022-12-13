@@ -467,17 +467,23 @@ config PVPANIC
 	  (guest) communicate panic events to the host.
 
 config DPG_SPI_MASTER
-	tristate "dpg spi master suport"
+	tristate "dpg spi master support"
 	help
 	  This driver provides support for the SPI master device of the HSD DPG project.  
 	  For setting cpol, cpha, pre_delay, post delay and clock per half bit with
 	  sysfs devices.
 
 config DPG_DATA_BUFFER
-	tristate "dpg data buffer suport"
+	tristate "dpg spi support"
 	help
 	  This driver provides support for the data buffer device of the HSD DPG project.  
 	  For setting...
+
+config DPG_DRIVER
+	tristate "dpg driver support for spi master and data buffer"
+	help
+	  This driver provides support for the data buffer device and the spi master
+	  of the HSD DPG project.	  
 
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"

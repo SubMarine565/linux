@@ -59,3 +59,4 @@ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
 obj-$(CONFIG_XILINX_SDFEC)	+= xilinx_sdfec.o
 obj-$(CONFIG_DPG_SPI_MASTER)	+= dpg_spi_master.o
 obj-$(CONFIG_DPG_DATA_BUFFER)	+= dpg_data_buffer.o
+obj-$(CONFIG_DPG_DRIVER)	+= dpg_driver.o
