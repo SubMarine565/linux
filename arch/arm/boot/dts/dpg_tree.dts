@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "socfpga_cyclone5_de1soc.dts"
+
 #define LWBRIDGE_BASE 0xff200000
 
 // Address spi master
 #define OFFSET_SPI_MASTER 0x0
-#define NUM_REGISTERS 0x13
+#define NUM_REGISTERS 0x18
 #define BASE_SPI_MASTER (LWBRIDGE_BASE+OFFSET_SPI_MASTER)
 
 / {
@@ -12,6 +14,8 @@
 		DPG_SPI_MASTER_0: DPG_SPI0@DpgSpiMasterStartAddress {
 			compatible = "dpg,spi_master";
 			reg= <BASE_SPI_MASTER NUM_REGISTERS>;
+			interrupts = < 0x0 0x28 0x4 >;
+			interrupt-parent = <&intc>;
 		};
 	};
 };

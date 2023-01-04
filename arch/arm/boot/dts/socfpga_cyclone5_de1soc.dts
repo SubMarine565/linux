@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "socfpga_cyclone5.dtsi"
-#include "dpg_tree.dtsi"
 
 / {
 	model = "Terasic DE1-SoC Development Kit";
