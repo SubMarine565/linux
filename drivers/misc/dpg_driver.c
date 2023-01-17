@@ -32,6 +32,7 @@
 #define KFIFO_DATA_LEN_SIZE 32
 
 #define OK 0
+#define WORD 4
 
 // Offsets data buffer
 #define OFFSET_DATA_BUFFER (0x0 / 4)
@@ -114,7 +115,7 @@ struct spi_master {
 	struct platform_device *pdev; // for print in read and write
 	struct kfifo fifo_data;
 	struct kfifo fifo_data_len;
-	struct mutex spi_master_mutex;
+	struct mutex device_mutex;
 	wait_queue_head_t wq_read;
 	wait_queue_head_t wq_write;
 };
@@ -164,35 +165,36 @@ module_platform_driver(spi_master_driver);
 // IRQ Handler
 static irqreturn_t handler_spi_master(int irq, void *dev_id)
 {
-	struct spi_master *data = dev_id;
+	struct spi_master *device = dev_id;
 	u32 interrupt_status = 0;
-	int data_register = 0;
+	int data_buffer = 0;
 	int data_len = 0;
 	int idx = 0;
 
 	interrupt_status =
-		ioread32(data->registers +
+		ioread32(device->registers +
 			 OFFSET_IRQ_STATUS); // Check if IRQ from this device
 	if (!interrupt_status)
 		return IRQ_NONE; // if not bye
 
 	// get number of registers to read
-	if (kfifo_out(&data->fifo_data_len, &data_len, 4) != 4)
+	if (kfifo_out(&device->fifo_data_len, &data_len, WORD) != WORD)
 		return -EFAULT;
 
 	for (idx = 0; idx < data_len; idx++) {
 		// read data from data buffer
-		data_register = ioread32(data->registers + OFFSET_RX_DATA);
+		data_buffer = ioread32(device->registers + OFFSET_RX_DATA);
 
 		if (idx < data_len - 1) {
 			// save data in fifo
-			kfifo_in(&data->fifo_data, &data_register, 4);
+			kfifo_in(&device->fifo_data, &data_buffer, WORD);
 		} else {
-			if ((data_len % 4) == 0) {
-				kfifo_in(&data->fifo_data, &data_register, 4);
+			if ((data_len % WORD) == 0) {
+				kfifo_in(&device->fifo_data, &data_buffer,
+					 WORD);
 			} else {
-				kfifo_in(&data->fifo_data, &data_register,
-					 (data_len % 4));
+				kfifo_in(&device->fifo_data, &data_buffer,
+					 (data_len % WORD));
 			}
 		}
 	}
@@ -203,11 +205,11 @@ static irqreturn_t handler_spi_master(int irq, void *dev_id)
 	}
 
 	// acknowledge IRQ
-	iowrite32(IRQ_ACK, data->registers + OFFSET_IRQ_STATUS);
+	iowrite32(IRQ_ACK, device->registers + OFFSET_IRQ_STATUS);
 
 	// wake up wait queues
-	wake_up_interruptible(&data->wq_write);
-	wake_up_interruptible(&data->wq_read);
+	wake_up_interruptible(&device->wq_write);
+	wake_up_interruptible(&device->wq_read);
 
 	return IRQ_HANDLED;
 }
@@ -215,10 +217,10 @@ static irqreturn_t handler_spi_master(int irq, void *dev_id)
 // file open -> lock file
 static ssize_t spi_master_open(struct inode *pinode, struct file *pfile)
 {
-	struct spi_master *spi_master =
+	struct spi_master *device =
 		container_of(pfile->private_data, struct spi_master, misc);
 
-	if (mutex_lock_interruptible(&spi_master->spi_master_mutex))
+	if (mutex_lock_interruptible(&device->device_mutex))
 		return -ERESTARTSYS;
 
 	return OK;
@@ -227,32 +229,32 @@ static ssize_t spi_master_open(struct inode *pinode, struct file *pfile)
 // file close -> release lock
 static int spi_master_release(struct inode *inode, struct file *pfile)
 {
-	struct spi_master *spi_master =
+	struct spi_master *device =
 		container_of(pfile->private_data, struct spi_master, misc);
-	mutex_unlock(&spi_master->spi_master_mutex);
+	mutex_unlock(&device->device_mutex);
 
 	return OK;
 }
 
-// Probe function -> driver loading
+// Probe function -> get ressources on module load
 static int spi_master_probe(struct platform_device *pdev)
 {
 	int status = 0;
 	int irq = 0;
-	void *kfifo_buff = NULL;
-	char deviceName[DRIVER_NAME_LEN];
-	struct spi_master *spi_master = NULL;
+	void *kfifo_buffer = NULL;
+	struct spi_master *device = NULL;
 	struct resource *io = NULL;
+	char device_name[DRIVER_NAME_LEN];
 	static atomic_t idx = ATOMIC_INIT(-1);
-	int deviceNumber = atomic_inc_return(&idx);
+	int device_number = atomic_inc_return(&idx);
 	// generate device names
-	snprintf(deviceName, DRIVER_NAME_LEN, "dpg_spi%d", deviceNumber);
+	snprintf(device_name, DRIVER_NAME_LEN, "dpg_spi%d", device_number);
 
 	dev_info(&pdev->dev, "Function %s entered.\n", __func__);
 
 	// alloc mem
-	spi_master = devm_kzalloc(&pdev->dev, sizeof(*spi_master), GFP_KERNEL);
-	if (IS_ERR(spi_master)) {
+	device = devm_kzalloc(&pdev->dev, sizeof(*device), GFP_KERNEL);
+	if (IS_ERR(device)) {
 		dev_err(&pdev->dev, "Error in kzalloc.\n");
 		return -EFAULT;
 	}
@@ -264,23 +266,23 @@ static int spi_master_probe(struct platform_device *pdev)
 		return -EFAULT;
 	}
 
-	spi_master->registers = devm_ioremap_resource(&pdev->dev, io);
-	if (IS_ERR(spi_master->registers)) {
+	device->registers = devm_ioremap_resource(&pdev->dev, io);
+	if (IS_ERR(device->registers)) {
 		dev_err(&pdev->dev, "Error in ioremap.\n");
 		return -EFAULT;
 	}
 
 	// set data
-	platform_set_drvdata(pdev, spi_master);
-	spi_master->pdev = pdev;
+	platform_set_drvdata(pdev, device);
+	device->pdev = pdev;
 
 	// set information
-	spi_master->misc.name = deviceName;
-	spi_master->misc.minor = MISC_DYNAMIC_MINOR;
-	spi_master->misc.fops = &spi_master_fops;
-	spi_master->misc.parent = &pdev->dev;
+	device->misc.name = device_name;
+	device->misc.minor = MISC_DYNAMIC_MINOR;
+	device->misc.fops = &spi_master_fops;
+	device->misc.parent = &pdev->dev;
 
-	// get read ready irq TODO
+	// get read ready irq
 	irq = platform_get_irq(pdev, 0);
 	if (!irq) {
 		dev_err(&pdev->dev, "No IRQ resource\n");
@@ -288,35 +290,35 @@ static int spi_master_probe(struct platform_device *pdev)
 	}
 
 	if (devm_request_irq(&pdev->dev, irq, handler_spi_master, IRQF_SHARED,
-			     dev_name(&pdev->dev), spi_master)) {
+			     dev_name(&pdev->dev), device)) {
 		dev_err(&pdev->dev, "failed to request IRQ\n");
 		return -ENOENT;
 	}
 
 	// kfifo for data
 	// buffer greater than a page for kfifo
-	kfifo_buff = vzalloc(KFIFO_DATA_SIZE);
-	if (kfifo_buff == NULL)
+	kfifo_buffer = vzalloc(KFIFO_DATA_SIZE);
+	if (kfifo_buffer == NULL)
 		return -ENOMEM;
 
-	if (kfifo_init(&spi_master->fifo_data, kfifo_buff, KFIFO_DATA_SIZE))
+	if (kfifo_init(&device->fifo_data, kfifo_buffer, KFIFO_DATA_SIZE))
 		return -ENOMEM;
 
 	// kfifo for data length
-	if (kfifo_alloc(&spi_master->fifo_data_len, KFIFO_DATA_LEN_SIZE,
+	if (kfifo_alloc(&device->fifo_data_len, KFIFO_DATA_LEN_SIZE,
 			GFP_KERNEL))
 		return -ENOMEM;
 
-	init_waitqueue_head(&spi_master->wq_read);
-	init_waitqueue_head(&spi_master->wq_write);
+	init_waitqueue_head(&device->wq_read);
+	init_waitqueue_head(&device->wq_write);
 
-	mutex_init(&spi_master->spi_master_mutex);
+	mutex_init(&device->device_mutex);
 
 	// switch on IRQ
-	iowrite32(IRQ_ON, spi_master->registers + OFFSET_IRQ_MASK);
+	iowrite32(IRQ_ON, device->registers + OFFSET_IRQ_MASK);
 
 	// register device
-	status = misc_register(&spi_master->misc);
+	status = misc_register(&device->misc);
 	if (status != OK) {
 		dev_err(&pdev->dev, "Error during device registration.\n");
 		return -EFAULT;
@@ -326,40 +328,41 @@ static int spi_master_probe(struct platform_device *pdev)
 	return OK;
 }
 
-// Remove function -> unload driver
+// Remove function -> clean up on module unload
 static int spi_master_remove(struct platform_device *pdev)
 {
-	struct spi_master *spi_master = NULL;
+	struct spi_master *device = NULL;
 
 	dev_info(&pdev->dev, "Function %s entered.\n", __func__);
 
-	spi_master = platform_get_drvdata(pdev);
-	// unmask IRQ TODO
-	iowrite32(IRQ_OFF, spi_master->registers + OFFSET_IRQ_MASK);
+	device = platform_get_drvdata(pdev);
+	// unmask IRQ
+	iowrite32(IRQ_OFF, device->registers + OFFSET_IRQ_MASK);
 	// unregister
-	misc_deregister(&spi_master->misc);
+	misc_deregister(&device->misc);
 	// set device to null
 	platform_set_drvdata(pdev, NULL);
 
 	// free vzalloc
-	kvfree(spi_master->fifo_data.kfifo.data);
+	kvfree(device->fifo_data.kfifo.data);
 
-	kfifo_free(&spi_master->fifo_data_len);
+	kfifo_free(&device->fifo_data_len);
 
-	mutex_destroy(&spi_master->spi_master_mutex);
+	mutex_destroy(&device->device_mutex);
 
 	dev_info(&pdev->dev, "Leaving %s remove.\n", __func__);
 	return OK;
 }
 
+// on device read
 static ssize_t spi_master_read(struct file *filp, char __user *buf,
 			       size_t count, loff_t *offp)
 {
-	int copiedBytes = 0;
-	struct spi_master *data =
+	int copied_bytes = 0;
+	struct spi_master *device =
 		container_of(filp->private_data, struct spi_master, misc);
 
-	dev_info(&data->pdev->dev, "In %s. count: %d, off: %lld\n", __func__,
+	dev_info(&device->pdev->dev, "In %s. count: %d, off: %lld\n", __func__,
 		 count, *offp);
 
 	// end of file
@@ -367,81 +370,87 @@ static ssize_t spi_master_read(struct file *filp, char __user *buf,
 	//	return OK;
 
 	// wait when fifo empty
-	if (wait_event_interruptible(data->wq_read,
-				     !kfifo_is_empty(&data->fifo_data)))
+	if (wait_event_interruptible(device->wq_read,
+				     !kfifo_is_empty(&device->fifo_data)))
 		return -ERESTARTSYS;
 
 	// write data when not
-	if (kfifo_to_user(&data->fifo_data, buf, count, &copiedBytes)) {
-		dev_err(&data->pdev->dev, "Error in %s.\n", __func__);
+	if (kfifo_to_user(&device->fifo_data, buf, count, &copied_bytes)) {
+		dev_err(&device->pdev->dev, "Error in %s.\n", __func__);
 		return -EFAULT;
 	}
 
-	*offp += copiedBytes;
-	return copiedBytes; // bytes read
+	*offp += copied_bytes;
+	return copied_bytes; // bytes read
 }
 
+// on device write
 static ssize_t spi_master_write(struct file *filp, const char __user *buf,
 				size_t count, loff_t *offp)
 {
-	int word = 0;
+	int data_user = 0;
 	int idx = 0;
 	int bytes_to_copy = 0;
-	struct spi_master *data =
+	struct spi_master *device =
 		container_of(filp->private_data, struct spi_master, misc);
-	dev_info(&data->pdev->dev, "In %s. count: %d, off: %lld\n", __func__,
+	dev_info(&device->pdev->dev, "In %s. count: %d, off: %lld\n", __func__,
 		 count, *offp);
 
 	// wait when buffer level at two
-	if (wait_event_interruptible(
-		    data->wq_write, (atomic_read(&buffer_level) < NUM_BUFFERS)))
+	if (wait_event_interruptible(device->wq_write,
+				     (atomic_read(&buffer_level) < NUM_BUFFERS)))
 		return -ERESTARTSYS;
 
 	bytes_to_copy =
-		(ioread32(data->registers + OFFSET_REMAINING_SPACE) * 4);
+		(ioread32(device->registers + OFFSET_REMAINING_SPACE) * WORD);
 
 	if (bytes_to_copy > count)
 		bytes_to_copy = count;
 
-	kfifo_in(&data->fifo_data_len, &bytes_to_copy, 4);
+	kfifo_in(&device->fifo_data_len, &bytes_to_copy, WORD);
 
 	// fill the data buffer
 	for (idx = 0; idx < bytes_to_copy; idx++) {
 		if (idx < bytes_to_copy - 1) {
-			if (copy_from_user(&word, buf + *offp, 4) != 0)
+			if (copy_from_user(&data_user, buf + *offp, WORD) != 0)
 				return -EFAULT;
 
-			iowrite32(word, data->registers + OFFSET_TX_DATA);
-			*offp += 4; // read word
+			iowrite32(data_user,
+				  device->registers + OFFSET_TX_DATA);
+			*offp += WORD; // read word
 		} else {
-			switch (bytes_to_copy % 4) {
+			switch (bytes_to_copy % WORD) {
 			case 1:
-				if (copy_from_user(&word, buf + *offp, 1) != 0)
+				if (copy_from_user(&data_user, buf + *offp,
+						   1) != 0)
 					return -EFAULT;
-				iowrite32((word & 0x000000FF),
-					  data->registers + OFFSET_TX_DATA);
+				iowrite32((data_user & 0x000000FF),
+					  device->registers + OFFSET_TX_DATA);
 				*offp += 1; // read 1 byte
 				break;
 			case 2:
-				if (copy_from_user(&word, buf + *offp, 2) != 0)
+				if (copy_from_user(&data_user, buf + *offp,
+						   2) != 0)
 					return -EFAULT;
-				iowrite32((word & 0x0000FFFF),
-					  data->registers + OFFSET_TX_DATA);
+				iowrite32((data_user & 0x0000FFFF),
+					  device->registers + OFFSET_TX_DATA);
 				*offp += 2; // read 2 byte
 				break;
 			case 3:
-				if (copy_from_user(&word, buf + *offp, 3) != 0)
+				if (copy_from_user(&data_user, buf + *offp,
+						   3) != 0)
 					return -EFAULT;
-				iowrite32((word & 0x00FFFFFF),
-					  data->registers + OFFSET_TX_DATA);
+				iowrite32((data_user & 0x00FFFFFF),
+					  device->registers + OFFSET_TX_DATA);
 				*offp += 3; // read 3 byte
 				break;
 			default:
-				if (copy_from_user(&word, buf + *offp, 4) != 0)
+				if (copy_from_user(&data_user, buf + *offp,
+						   WORD) != 0)
 					return -EFAULT;
-				iowrite32(word,
-					  data->registers + OFFSET_TX_DATA);
-				*offp += 4; // read word
+				iowrite32(data_user,
+					  device->registers + OFFSET_TX_DATA);
+				*offp += WORD; // read word
 				break;
 			}
 		}
@@ -449,32 +458,34 @@ static ssize_t spi_master_write(struct file *filp, const char __user *buf,
 	atomic_inc(&buffer_level);
 
 	// start signal for data buffer
-	iowrite32(START, data->registers + OFFSET_TX_START);
+	iowrite32(START, device->registers + OFFSET_TX_START);
 
 	return bytes_to_copy;
 }
 
+// Get CPOL
 static ssize_t spi_master_cpol_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
-	struct spi_master *data = dev_get_drvdata(dev);
-	int value = ioread32(data->registers + OFFSET_CPOL);
+	struct spi_master *device = dev_get_drvdata(dev);
+	int value = ioread32(device->registers + OFFSET_CPOL);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", value);
 }
 
+// Set CPOL
 static ssize_t spi_master_cpol_store(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t count)
 {
 	int bit = 0;
-	struct spi_master *data = dev_get_drvdata(dev);
+	struct spi_master *device = dev_get_drvdata(dev);
 
-	dev_info(&data->pdev->dev, "In %s. count: %d\n", __func__, count);
+	dev_info(&device->pdev->dev, "In %s. count: %d\n", __func__, count);
 
 	// parse buf to bit and check format
 	if (sscanf(buf, "%d", &bit) != 1) {
-		dev_err(&data->pdev->dev, "error in %s, invalid format: %s\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid format: %s\n",
 			__func__, buf);
 		return -EINVAL;
 	}
@@ -482,11 +493,11 @@ static ssize_t spi_master_cpol_store(struct device *dev,
 	// check value
 	if (bit == 1 || bit == 0) {
 		// Print value of bit -> for testing
-		dev_info(&data->pdev->dev, "In %s. Value read: %d\n", __func__,
-			 bit);
-		iowrite32(bit, data->registers + OFFSET_CPOL);
+		dev_info(&device->pdev->dev, "In %s. Value read: %d\n",
+			 __func__, bit);
+		iowrite32(bit, device->registers + OFFSET_CPOL);
 	} else {
-		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid value: %d\n",
 			__func__, bit);
 		return -EINVAL;
 	}
@@ -494,27 +505,29 @@ static ssize_t spi_master_cpol_store(struct device *dev,
 	return count;
 }
 
+// Get CPHA
 static ssize_t spi_master_cpha_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
-	struct spi_master *data = dev_get_drvdata(dev);
-	int value = ioread32(data->registers + OFFSET_CPHA);
+	struct spi_master *device = dev_get_drvdata(dev);
+	int value = ioread32(device->registers + OFFSET_CPHA);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", value);
 }
 
+// Read CPHA
 static ssize_t spi_master_cpha_store(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t count)
 {
 	int bit = 0;
-	struct spi_master *data = dev_get_drvdata(dev);
+	struct spi_master *device = dev_get_drvdata(dev);
 
-	dev_info(&data->pdev->dev, "In %s. count: %d\n", __func__, count);
+	dev_info(&device->pdev->dev, "In %s. count: %d\n", __func__, count);
 
 	// parse buf to bit and check format
 	if (sscanf(buf, "%d", &bit) != 1) {
-		dev_err(&data->pdev->dev, "error in %s, invalid format: %s\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid format: %s\n",
 			__func__, buf);
 		return -EINVAL;
 	}
@@ -522,11 +535,11 @@ static ssize_t spi_master_cpha_store(struct device *dev,
 	// check value
 	if (bit == 1 || bit == 0) {
 		// Print value of bit -> for testing
-		dev_info(&data->pdev->dev, "In %s. Value read: %d\n", __func__,
-			 bit);
-		iowrite32(bit, data->registers + OFFSET_CPHA);
+		dev_info(&device->pdev->dev, "In %s. Value read: %d\n",
+			 __func__, bit);
+		iowrite32(bit, device->registers + OFFSET_CPHA);
 	} else {
-		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid value: %d\n",
 			__func__, bit);
 		return -EINVAL;
 	}
@@ -534,28 +547,30 @@ static ssize_t spi_master_cpha_store(struct device *dev,
 	return count;
 }
 
+// Get pre delay
 static ssize_t spi_master_pre_delay_show(struct device *dev,
 					 struct device_attribute *attr,
 					 char *buf)
 {
-	struct spi_master *data = dev_get_drvdata(dev);
-	int value = ioread32(data->registers + OFFSET_PRE_DELAY);
+	struct spi_master *device = dev_get_drvdata(dev);
+	int value = ioread32(device->registers + OFFSET_PRE_DELAY);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", value);
 }
 
+// Set pre delay
 static ssize_t spi_master_pre_delay_store(struct device *dev,
 					  struct device_attribute *attr,
 					  const char *buf, size_t count)
 {
 	int bit = 0;
-	struct spi_master *data = dev_get_drvdata(dev);
+	struct spi_master *device = dev_get_drvdata(dev);
 
-	dev_info(&data->pdev->dev, "In %s. count: %d\n", __func__, count);
+	dev_info(&device->pdev->dev, "In %s. count: %d\n", __func__, count);
 
 	// parse buf to bit and check format
 	if (sscanf(buf, "%d", &bit) != 1) {
-		dev_err(&data->pdev->dev, "error in %s, invalid format: %s\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid format: %s\n",
 			__func__, buf);
 		return -EINVAL;
 	}
@@ -563,11 +578,11 @@ static ssize_t spi_master_pre_delay_store(struct device *dev,
 	// check value
 	if (bit < (1 << 8) || bit >= 0) {
 		// Print value of bit -> for testing
-		dev_info(&data->pdev->dev, "In %s. Value read: %d\n", __func__,
-			 bit);
-		iowrite32(bit, data->registers + OFFSET_PRE_DELAY);
+		dev_info(&device->pdev->dev, "In %s. Value read: %d\n",
+			 __func__, bit);
+		iowrite32(bit, device->registers + OFFSET_PRE_DELAY);
 	} else {
-		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid value: %d\n",
 			__func__, bit);
 		return -EINVAL;
 	}
@@ -575,30 +590,32 @@ static ssize_t spi_master_pre_delay_store(struct device *dev,
 	return count;
 }
 
+// Get post delay
 static ssize_t spi_master_post_delay_show(struct device *dev,
 					  struct device_attribute *attr,
 					  char *buf)
 {
-	struct spi_master *data = dev_get_drvdata(dev);
-	int value = ioread32(data->registers + OFFSET_POST_DELAY);
+	struct spi_master *device = dev_get_drvdata(dev);
+	int value = ioread32(device->registers + OFFSET_POST_DELAY);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", value);
 
-	value = ioread32(data->registers + 0xC);
+	value = ioread32(device->registers + 0xC);
 }
 
+// Set post delay
 static ssize_t spi_master_post_delay_store(struct device *dev,
 					   struct device_attribute *attr,
 					   const char *buf, size_t count)
 {
 	int bit = 0;
-	struct spi_master *data = dev_get_drvdata(dev);
+	struct spi_master *device = dev_get_drvdata(dev);
 
-	dev_info(&data->pdev->dev, "In %s. count: %d\n", __func__, count);
+	dev_info(&device->pdev->dev, "In %s. count: %d\n", __func__, count);
 
 	// parse buf to bit and check format
 	if (sscanf(buf, "%d", &bit) != 1) {
-		dev_err(&data->pdev->dev, "error in %s, invalid format: %s\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid format: %s\n",
 			__func__, buf);
 		return -EINVAL;
 	}
@@ -606,11 +623,11 @@ static ssize_t spi_master_post_delay_store(struct device *dev,
 	// check value
 	if (bit < (1 << 8) || bit >= 0) {
 		// Print value of bit -> for testing
-		dev_info(&data->pdev->dev, "In %s. Value read: %d\n", __func__,
-			 bit);
-		iowrite32(bit, data->registers + OFFSET_POST_DELAY);
+		dev_info(&device->pdev->dev, "In %s. Value read: %d\n",
+			 __func__, bit);
+		iowrite32(bit, device->registers + OFFSET_POST_DELAY);
 	} else {
-		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid value: %d\n",
 			__func__, bit);
 		return -EINVAL;
 	}
@@ -618,28 +635,30 @@ static ssize_t spi_master_post_delay_store(struct device *dev,
 	return count;
 }
 
+// Get clock per half bit
 static ssize_t spi_master_clk_per_half_bit_show(struct device *dev,
 						struct device_attribute *attr,
 						char *buf)
 {
-	struct spi_master *data = dev_get_drvdata(dev);
-	int value = ioread32(data->registers + OFFSET_CLK_PER_HALF_BIT);
+	struct spi_master *device = dev_get_drvdata(dev);
+	int value = ioread32(device->registers + OFFSET_CLK_PER_HALF_BIT);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", value);
 }
 
+// Set clock per half bit
 static ssize_t spi_master_clk_per_half_bit_store(struct device *dev,
 						 struct device_attribute *attr,
 						 const char *buf, size_t count)
 {
 	int bit = 0;
-	struct spi_master *data = dev_get_drvdata(dev);
+	struct spi_master *device = dev_get_drvdata(dev);
 
-	dev_info(&data->pdev->dev, "In %s. count: %d\n", __func__, count);
+	dev_info(&device->pdev->dev, "In %s. count: %d\n", __func__, count);
 
 	// parse buf to bit and check format
 	if (sscanf(buf, "%d", &bit) != 1) {
-		dev_err(&data->pdev->dev, "error in %s, invalid format: %s\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid format: %s\n",
 			__func__, buf);
 		return -EINVAL;
 	}
@@ -647,11 +666,11 @@ static ssize_t spi_master_clk_per_half_bit_store(struct device *dev,
 	// check value
 	if (bit < (1 << 16) || bit > 0) {
 		// Print value of bit -> for testing
-		dev_info(&data->pdev->dev, "In %s. Value read: %d\n", __func__,
-			 bit);
-		iowrite32(bit, data->registers + OFFSET_CLK_PER_HALF_BIT);
+		dev_info(&device->pdev->dev, "In %s. Value read: %d\n",
+			 __func__, bit);
+		iowrite32(bit, device->registers + OFFSET_CLK_PER_HALF_BIT);
 	} else {
-		dev_err(&data->pdev->dev, "error in %s, invalid value: %d\n",
+		dev_err(&device->pdev->dev, "error in %s, invalid value: %d\n",
 			__func__, bit);
 		return -EINVAL;
 	}
@@ -659,20 +678,21 @@ static ssize_t spi_master_clk_per_half_bit_store(struct device *dev,
 	return count;
 }
 
-// TODO -> MSB reg 7, LSB reg0
+// Get git revision
 static ssize_t spi_master_gitrev_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
-	struct spi_master *data = dev_get_drvdata(dev);
-	u32 word[GIT_REV_WORDS] = { 0 };
+	struct spi_master *device = dev_get_drvdata(dev);
+	u32 gitrev[GIT_REV_WORDS] = { 0 };
 	int idx = 0;
 
 	for (idx = 0; idx < GIT_REV_WORDS; idx++) {
-		word[idx] = ioread32(data->registers + OFFSET_GIT_REV + idx);
+		gitrev[idx] =
+			ioread32(device->registers + OFFSET_GIT_REV + idx);
 	}
 
-	return scnprintf(buf, PAGE_SIZE, "%8x%8x%8x%8x%8x%8x\n", word[5],
-			 word[4], word[3], word[2], word[1], word[0]);
+	return scnprintf(buf, PAGE_SIZE, "%8x%8x%8x%8x%8x%8x\n", gitrev[5],
+			 gitrev[4], gitrev[3], gitrev[2], gitrev[1], gitrev[0]);
 }
 
 MODULE_LICENSE("GPL");
